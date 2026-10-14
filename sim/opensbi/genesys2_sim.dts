@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Eoghain Gray
+
+// genesys2_sim.dts
+//
+// Minimal device tree for OpenSBI's generic (FDT-based) platform, matching
+// this project's Phase 2 sim addresses exactly: CLINT at 0x0200_0000, PLIC
+// at 0x0C00_0000, UART at 0x1000_0000, RAM at 0x8000_0000 (8MB, matching
+// sim/tb_riscv.sv's MEM_WORDS — bumped from 256KB in Phase 2.5 to give
+// OpenSBI's FW_PAYLOAD_OFFSET/FW_PAYLOAD_FDT_ADDR placement generous
+// headroom). Embedded into OpenSBI at build time via
+// FW_FDT_PATH — our CPU has no prior boot stage to pass a1=<fdt addr>, so
+// OpenSBI's own fw_base.S loads a1 from its embedded copy instead (see
+// firmware/fw_base.S's `#ifdef FW_FDT_PATH` path).
+//
+// timebase-frequency is nominal (1 MHz) — this core has no real-vs-sim
+// timebase divider (rtl/periph/clint.sv's mtime increments every clock), so
+// this value doesn't need to match any real clock rate for this milestone;
+// it will need reconciling once Phase 3/4 cares about wall-clock-accurate
+// timing.
+//
+// CLINT's single "reg" is intentionally parsed by two independent OpenSBI
+// FDT drivers (timer + IPI), each applying its own fixed sub-offset
+// (CLINT_MTIMER_OFFSET=0x4000, CLINT_MSWI_OFFSET=0x0000) — this is exactly
+// what rtl/periph/clint.sv already implements (msip @ +0x0000, mtimecmp @
+// +0x4000, mtime @ +0xBFF8), confirmed against OpenSBI's
+// lib/utils/timer/fdt_timer_mtimer.c and lib/utils/ipi/fdt_ipi_mswi.c.
+
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "genesys2,sim";
+	compatible = "genesys2,sim";
+
+	chosen {
+		stdout-path = "/soc/serial@10000000";
+		bootargs = "earlycon=uart8250,mmio,0x10000000 console=ttyS0,115200 debug";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <1000000>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+			status = "okay";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x08000000>; // 128MB, matches tb_riscv.sv MEM_WORDS
+		// (bumped 2026-07-16, same day: 64MB left too little free RAM
+		// after OpenSBI+kernel+FDT overhead, causing a genuine kernel
+		// OOM panic during boot)
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "riscv,clint0";
+			reg = <0x02000000 0x00010000>;
+			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
+		};
+
+		plic: plic@c000000 {
+			compatible = "riscv,plic0";
+			reg = <0x0c000000 0x04000000>;
+			riscv,ndev = <1>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			// cpu0_intc 9 (2026-07-22): the Supervisor-external context —
+			// added alongside the pre-existing Machine-external one (11).
+			// Linux's irq-sifive-plic.c driver only registers a
+			// plic_handler for a context whose parent hwirq equals the
+			// S-mode external cause (9); a context-11-only (M-external)
+			// list produced "0 handlers for 1 contexts" at boot, leaving
+			// handler->enable_base NULL and crashing (NULL deref in
+			// plic_toggle(), "Unable to handle kernel access to user
+			// memory... at virtual address 00000000") the first time
+			// anything actually enables a PLIC-routed IRQ (the UART's,
+			// via request_threaded_irq() during tty_open()) — every
+			// earlier boot milestone only ever used the UART via polling/
+			// early console, never through the real interrupt path, so
+			// this was never previously exercised. Order matters: this
+			// driver assigns context_id from list position (context 0 =
+			// first entry), so the pre-existing M-mode entry is kept
+			// first to avoid disturbing OpenSBI's own M-mode PLIC usage.
+			interrupts-extended = <&cpu0_intc 11>, <&cpu0_intc 9>;
+		};
+
+		serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x10000000 0x1000>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			current-speed = <0>; // no baud divisor modeled — skip DLL/DLM programming
+			// clock-frequency (2026-07-21): without this, Linux's 8250_of.c
+			// driver (drivers/tty/serial/serial_port.c's
+			// uart_read_and_validate_port_properties(), which reads this
+			// property directly into port->uartclk) falls through to a
+			// devm_clk_get_enabled() clock-framework lookup once
+			// port->uartclk is still 0 — which fails (-ENOENT, "of_serial
+			// ...: probe with driver of_serial failed with error -2" in
+			// dmesg) since this platform has no clock-controller node at
+			// all. That silent probe failure means no real /dev/ttyS0 ever
+			// gets registered, which in turn means init/main.c's
+			// console_on_rootfs() can't open /dev/console for PID 1's
+			// stdin/stdout/stderr ("Warning: unable to open an initial
+			// console") — every process descending from /init inherits
+			// closed fds 0/1/2. The exact value is arbitrary (current-speed
+			// is already 0 — no real baud divisor is ever programmed against
+			// this core's UART model — this property only exists to satisfy
+			// the driver's own probe-time property read), 1843200 is the
+			// conventional 16550 reference clock rate.
+			clock-frequency = <1843200>;
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+		};
+	};
+};

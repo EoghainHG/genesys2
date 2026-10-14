@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Eoghain Gray
+
+# PID 1 for the Genesys 2 RISC-V board's Linux bring-up.
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export TERM=vt100
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+# devtmpfs is NOT auto-mounted here: the kernel only calls devtmpfs_mount()
+# from init/do_mounts.c's prepare_namespace(), which is skipped entirely
+# whenever a working /init is found on the initramfs (our case) -- that
+# path is reserved for the classic initrd-then-pivot boot. So /dev must be
+# mounted explicitly, or it stays empty (confirmed empty in this project's
+# initramfs staging tree) and /dev/console/etc. never materialize.
+mount -t devtmpfs devtmpfs /dev
+
+# PID 1 starts with all three standard fds closed: console_on_rootfs()
+# (init/main.c) tries to open /dev/console before /init ever runs, but
+# fails since /dev was empty until the mount above -- mounting devtmpfs
+# does not retroactively fix fds that were never opened. Without this,
+# every echo below writes to a closed fd 1 (silently discarded) and the
+# final exec /bin/sh inherits a closed fd 0, reads EOF immediately, and
+# exits(0) -- exactly the "clean exit, no console output" symptom this
+# fixes.
+#
+# 2026-09-09: bind to /dev/hvc0 (SBI console) explicitly rather than
+# /dev/console. With CONFIG_VT=y + dummycon, /dev/console can route to the
+# VT dummy console (all I/O discarded) instead of the real serial device --
+# observed hanging exactly here with a polled ttyS0. /dev/hvc0 is
+# unambiguous and never touches the interrupt-driven 8250 path (the source
+# of the vi/top livelock). Fall back to ttyS0 then /dev/console.
+if [ -c /dev/hvc0 ]; then
+	exec 0<>/dev/hvc0 1>&0 2>&0
+elif [ -c /dev/ttyS0 ]; then
+	exec 0<>/dev/ttyS0 1>&0 2>&0
+else
+	exec 0<>/dev/console 1>&0 2>&0
+fi
+
+echo ""
+echo "=========================================="
+echo " Genesys 2: Linux is up. Welcome!"
+echo "=========================================="
+echo ""
+
+exec /bin/sh

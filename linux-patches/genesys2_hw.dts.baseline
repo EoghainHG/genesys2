@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Eoghain Gray
+
+// genesys2_hw.dts
+//
+// Real-hardware device tree for OpenSBI's generic (FDT-based) platform on
+// the Genesys 2 (XC7K325T). CLINT/PLIC/UART addresses and the UART node
+// match this project's core RTL exactly (rtl/periph/clint.sv,
+// rtl/periph/plic.sv, rtl/periph/uart.sv). Genesys2 has 1GB DDR3 via MIG
+// and clk_core's real measured frequency is 18,753,922 Hz -- see
+// fpga/genesys2_top_ddr.sv's own clk_core header comment (period=53.323ns
+// per Vivado's timing report; 1e9/53.323 = 18,753,922.4.., truncated to
+// the integer Hz value below).
+//
+// No prior boot stage exists on this board -- this DTB MUST be baked
+// into OpenSBI at build time via FW_FDT_PATH (see Makefile's
+// build-opensbi-hw target), not passed at runtime.
+//
+// Hard-won real-hardware debugging lessons, applicable as long as this
+// RTL is unchanged:
+//   (a) PLIC's interrupts-extended lists the M-mode context (11) BEFORE
+//       the S-mode context (9) -- Linux's irq-sifive-plic.c assigns
+//       context IDs by list position; wrong order = "0 handlers for 1
+//       contexts" and a NULL-pointer crash in plic_toggle() the first
+//       time any PLIC-routed IRQ (the UART's) is enabled.
+//   (b) serial@10000000 keeps its explicit clock-frequency property --
+//       without it, 8250_of.c's clock-framework fallback fails
+//       (-ENOENT, no clock-controller node on this platform), no
+//       /dev/ttyS0 gets registered, PID 1 inherits closed stdio.
+//   (c) FDT baked in via FW_FDT_PATH, not passed at runtime (see above).
+
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "genesys2,hw";
+	compatible = "genesys2,hw";
+
+	chosen {
+		stdout-path = "/soc/serial@10000000";
+		bootargs = "earlycon=uart8250,mmio,0x10000000 console=ttyS0,115200 debug";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <56261955>; // clk_core, /4 off MIG ui_clk (2026-09-06,
+		                                  // was /6), from a real
+		                                  // Vivado timing report (period=17.774ns);
+		                                  // clint.sv's mtime increments every clock,
+		                                  // no separate real-vs-sim divider exists.
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+			status = "okay";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x40000000>; // 1GB DDR3 via MIG, full CPU-side window
+		                                // (0x8000_0000-0xBFFF_FFFF)
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "riscv,clint0";
+			reg = <0x02000000 0x00010000>;
+			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
+		};
+
+		plic: plic@c000000 {
+			compatible = "riscv,plic0";
+			reg = <0x0c000000 0x04000000>;
+			riscv,ndev = <1>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			// Order matters -- see header comment (a).
+			interrupts-extended = <&cpu0_intc 11>, <&cpu0_intc 9>;
+		};
+
+		serial@10000000 {
+			// "ns16450", NOT "ns16550a" (2026-09-05, real bug found on the
+			// first real Linux boot): 8250_of.c's of_serial16550 match table
+			// sets port.type directly from the compatible string rather than
+			// probing real hardware -- "ns16550a" forces PORT_16550A, which
+			// the serial core gives fifosize=16 unconditionally. rtl/periph/
+			// uart.sv has NO real FIFO (a single tx_data/tx_valid holding
+			// register only) and doesn't reject/hold a THR write that
+			// arrives while tx_busy is still asserted -- rtl/bridge/
+			// uart_phy.sv's TX_IDLE-only accept logic just silently drops
+			// any such write instead. The kernel's own printk output uses a
+			// separate synchronous polling console-write path (always
+			// correct, one byte at a time, real busy-wait) and came through
+			// perfectly on real hardware; but /init's own userspace echo
+			// output goes through the regular buffered/interrupt-driven tty
+			// path, which assumes it can burst up to fifosize bytes per
+			// THRE-interrupt without re-checking busy between each one --
+			// with fifosize=16 assumed against real hardware with zero FIFO,
+			// every byte past the first in a burst vanished. Confirmed by
+			// diffing the real captured (corrupted) banner text against
+			// this project's own init script's known-good source string
+			// (initramfs :/init, " Genesys 2: Linux is up. Welcome!"):
+			// every surviving character in the capture appears in the exact
+			// same relative order as the original, purely with characters
+			// missing -- a dropped-byte signature, not bit-level corruption
+			// or reordering (which would have already ruled out the
+			// baud-rate-style bug class fixed 2026-09-03). PORT_16450 gives
+			// fifosize=1, forcing the driver to write exactly one byte per
+			// THRE-interrupt and wait for the next one -- matching this
+			// hardware's real capability exactly.
+			compatible = "ns16450";
+			reg = <0x10000000 0x1000>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			current-speed = <0>; // no baud divisor modeled -- skip DLL/DLM programming
+			clock-frequency = <1843200>; // see header comment (b)
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+		};
+	};
+};

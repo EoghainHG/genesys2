@@ -1,0 +1,22 @@
+# Build outputs (Vivado runs, sim builds, logs, captures)
+/build/
+/opensbi/build/
+.Xil/
+vivado*.jou
+vivado*.log
+*.backup.jou
+*.backup.log
+
+# Upstream clone fetched by `make` (see TESTS_URL in Makefile)
+/riscv-tests/
+
+# Python / editor cruft
+__pycache__/
+*.pyc
+*.swp
+
+# Vivado-generated debug artifacts dropped at repo root
+clockInfo.txt
+
+# Personal working notes, not part of the published project
+/PORT_PLAN.md

@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Eoghain Gray
+
+# PID 1 for the Genesys 2 RISC-V board's Linux bring-up.
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export TERM=vt100
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs devtmpfs /dev
+
+# 2026-09-09: bind to /dev/hvc0 (SBI console). With CONFIG_VT=y + dummycon,
+# /dev/console can route to the VT dummy console (all I/O discarded).
+# /dev/hvc0 is unambiguous and never touches the interrupt-driven 8250
+# path (the source of the vi/top livelock).
+if [ -c /dev/hvc0 ]; then
+	exec 0<>/dev/hvc0 1>&0 2>&0
+elif [ -c /dev/ttyS0 ]; then
+	exec 0<>/dev/ttyS0 1>&0 2>&0
+else
+	exec 0<>/dev/console 1>&0 2>&0
+fi
+
+echo ""
+echo "=========================================="
+echo " Genesys 2: Linux is up. Welcome!"
+echo "=========================================="
+echo ""
+
+# RX self-test (pure shell builtin -- no fork/exec, canonical line mode).
+echo "RX test: type a word + Enter within 15s ..."
+if read -t 15 RXLINE; then
+	echo "RX OK: got [$RXLINE]"
+else
+	echo "RX FAIL: nothing received (timeout)"
+fi
+echo ""
+
+exec /bin/sh

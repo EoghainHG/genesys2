@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Eoghain Gray
+
+// genesys2_hw.dts
+//
+// Real-hardware device tree for OpenSBI's generic (FDT-based) platform on
+// the Genesys 2 (XC7K325T). CLINT/PLIC/UART addresses and the UART node
+// match this project's core RTL exactly (rtl/periph/clint.sv,
+// rtl/periph/plic.sv, rtl/periph/uart.sv). Genesys2 has 1GB DDR3 via MIG
+// and clk_core's real measured frequency is 18,753,922 Hz -- see
+// fpga/genesys2_top_ddr.sv's own clk_core header comment (period=53.323ns
+// per Vivado's timing report; 1e9/53.323 = 18,753,922.4.., truncated to
+// the integer Hz value below).
+//
+// No prior boot stage exists on this board -- this DTB MUST be baked
+// into OpenSBI at build time via FW_FDT_PATH (see Makefile's
+// build-opensbi-hw target), not passed at runtime.
+//
+// Hard-won real-hardware debugging lessons, applicable as long as this
+// RTL is unchanged:
+//   (a) PLIC's interrupts-extended lists the M-mode context (11) BEFORE
+//       the S-mode context (9) -- Linux's irq-sifive-plic.c assigns
+//       context IDs by list position; wrong order = "0 handlers for 1
+//       contexts" and a NULL-pointer crash in plic_toggle() the first
+//       time any PLIC-routed IRQ (the UART's) is enabled.
+//   (b) serial@10000000 keeps its explicit clock-frequency property --
+//       without it, 8250_of.c's clock-framework fallback fails
+//       (-ENOENT, no clock-controller node on this platform), no
+//       /dev/ttyS0 gets registered, PID 1 inherits closed stdio.
+//   (c) FDT baked in via FW_FDT_PATH, not passed at runtime (see above).
+
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "genesys2,hw";
+	compatible = "genesys2,hw";
+
+	chosen {
+		stdout-path = "/soc/serial@10000000";
+		// 2026-09-12: back on console=ttyS0 (the interrupt-driven path) for
+		// good -- the hvc0 detour (2026-09-09/10) traded the vi/top
+		// TX-interrupt-burst livelock for a still-unexplained dead RX path,
+		// and cost two sessions without landing a working console either
+		// way. The real fix is the new TX/RX FIFOs (rtl/periph/uart.sv,
+		// rtl/bridge/uart_phy.sv, see serial@10000000's own comment below)
+		// -- it targets the livelock's actual mechanism (one THRE interrupt
+		// per byte during a burst) directly, needs no OpenSBI/SBI/hvc
+		// machinery at all, and keeps RX on the already-proven interrupt
+		// path. CONFIG_HVC_RISCV_SBI stays compiled in (harmless, unused)
+		// and the OpenSBI ns16450-match patch (opensbi-patches/) stays too.
+		bootargs = "earlycon=uart8250,mmio,0x10000000 console=ttyS0,115200";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <56261955>; // clk_core, /4 off MIG ui_clk (2026-09-06,
+		                                  // was /6), from a real
+		                                  // Vivado timing report (period=17.774ns);
+		                                  // clint.sv's mtime increments every clock,
+		                                  // no separate real-vs-sim divider exists.
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+			status = "okay";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x40000000>; // 1GB DDR3 via MIG, full CPU-side window
+		                                // (0x8000_0000-0xBFFF_FFFF)
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "riscv,clint0";
+			reg = <0x02000000 0x00010000>;
+			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
+		};
+
+		plic: plic@c000000 {
+			compatible = "riscv,plic0";
+			reg = <0x0c000000 0x04000000>;
+			riscv,ndev = <1>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			// Order matters -- see header comment (a).
+			interrupts-extended = <&cpu0_intc 11>, <&cpu0_intc 9>;
+		};
+
+		serial@10000000 {
+			// "ns16550a" (2026-09-12, back from "ns16450"): rtl/periph/
+			// uart.sv now has a REAL 16-entry TX FIFO (and
+			// rtl/bridge/uart_phy.sv a matching 16-entry RX FIFO) -- see
+			// each file's own 2026-09-12 header comment -- so `fifosize=16`
+			// is finally true in hardware, not just claimed.
+			//
+			// History: this was "ns16450" (fifosize=1) from 2026-09-05,
+			// because 8250_of.c's of_serial16550 match table sets port.type
+			// directly from the compatible string, and back then
+			// "ns16550a" (fifosize=16) was a real lie -- the register model
+			// had only a single tx_data/tx_valid holding slot with no
+			// backpressure, so every byte past the first in a THR burst
+			// silently vanished (confirmed by diffing a corrupted real
+			// boot-banner capture against the known-good source string --
+			// a clean dropped-byte signature, order preserved, characters
+			// missing). fifosize=1 forced Linux to write exactly one byte
+			// per THRE interrupt and wait for the next one, which fixed the
+			// dropped bytes but is *why* the vi/top interactive-console
+			// livelock existed in the first place:
+			// one THRE interrupt per byte during a big screen-redraw burst
+			// is exactly the storm/re-entry pattern that triggered it. A
+			// real FIFO turns that into one interrupt per ~16-byte burst,
+			// which is the actual point of a FIFO and the real fix.
+			compatible = "ns16550a";
+			reg = <0x10000000 0x1000>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			current-speed = <0>; // no baud divisor modeled -- skip DLL/DLM programming
+			clock-frequency = <1843200>; // see header comment (b)
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+		};
+	};
+};
